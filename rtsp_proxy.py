@@ -6,10 +6,12 @@ import threading
 from queue import Queue
 import subprocess
 import sys
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 
 class RTSPProxy:
-    def __init__(self, input_url: str, output_url: str, timeout_seconds: float = 15.0):
+    def __init__(self, input_url: str, output_url: str, timeout_seconds: float = 15.0,
+                 codec: str = 'h264', bitrate: str = '2M', preset: str = 'medium',
+                 gop: int = 30):
         self.input_url = input_url
         self.output_url = output_url
         self.timeout_seconds = timeout_seconds
@@ -19,6 +21,39 @@ class RTSPProxy:
         self.last_frame: Optional[np.ndarray] = None
         self.frame_width = 1920  # Default resolution
         self.frame_height = 1080
+        
+        # Encoding parameters
+        self.codec = codec
+        self.bitrate = bitrate
+        self.preset = preset
+        self.gop = gop
+
+    def get_codec_parameters(self) -> Dict:
+        """Get FFmpeg parameters for the selected codec."""
+        params = {
+            'c:v': self.codec,
+            'b:v': self.bitrate,
+            'g': str(self.gop),  # GOP size
+        }
+        
+        # Codec-specific parameters
+        if self.codec in ['h264', 'libx264']:
+            params.update({
+                'preset': self.preset,
+                'tune': 'zerolatency',
+                'profile:v': 'main',
+                "pix_fmt": "yuv420p"
+            })
+        elif self.codec == 'h265' or self.codec == 'libx265':
+            params.update({
+                'preset': self.preset,
+                'x265-params': 'no-repeat-headers=1',
+            })
+        elif self.codec == 'copy':
+            # Remove unnecessary parameters for stream copy
+            params = {'c:v': 'copy'}
+            
+        return params
 
     def create_error_frame(self, message: str = "No frames received") -> np.ndarray:
         """Create a black frame with error message."""
@@ -76,23 +111,29 @@ class RTSPProxy:
         """Write frames to output RTSP stream."""
         while self.running:
             try:
-                process = (
+                # Get codec parameters
+                codec_params = self.get_codec_parameters()
+                
+                # Build ffmpeg command
+                stream = (
                     ffmpeg
                     .input('pipe:', format='rawvideo', pix_fmt='rgb24', s=f'{self.frame_width}x{self.frame_height}')
-                    .output(self.output_url, format='rtsp', rtsp_transport='tcp')
+                    .output(self.output_url, format='rtsp', rtsp_transport='tcp', **codec_params)
                     .overwrite_output()
-                    .run_async(pipe_stdin=True)
                 )
+                
+                # For debugging: print the ffmpeg command
+                print("FFmpeg command:", ' '.join(stream.compile()))
+                
+                process = stream.run_async(pipe_stdin=True)
 
                 while self.running:
                     current_time = time.time()
                     frame = None
 
-                    # Check if we have a new frame
                     try:
                         frame = self.frame_queue.get_nowait()
                     except:
-                        # No new frame available
                         if self.last_frame is not None:
                             if current_time - self.last_frame_time > self.timeout_seconds:
                                 frame = self.create_error_frame()
@@ -139,15 +180,37 @@ if __name__ == "__main__":
     parser.add_argument('output_url', help='Output RTSP URL')
     parser.add_argument('--timeout', type=float, default=15.0,
                       help='Timeout in seconds before showing error message (default: 15.0)')
+    parser.add_argument('--codec', type=str, default='h264',
+                      choices=['libx264', 'libx265', 'copy'],
+                      help='Output codec (default: h264)')
+    parser.add_argument('--bitrate', type=str, default='2M',
+                      help='Output bitrate (e.g., 2M, 4M, 8M) (default: 2M)')
+    parser.add_argument('--preset', type=str, default='medium',
+                      choices=['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow'],
+                      help='Encoding preset (default: medium)')
+    parser.add_argument('--gop', type=int, default=30,
+                      help='GOP size (default: 30)')
     args = parser.parse_args()
 
-    proxy = RTSPProxy(args.input_url, args.output_url, args.timeout)
+    proxy = RTSPProxy(
+        args.input_url,
+        args.output_url,
+        args.timeout,
+        codec=args.codec,
+        bitrate=args.bitrate,
+        preset=args.preset,
+        gop=args.gop
+    )
     
     try:
         proxy.start()
         print(f"RTSP Proxy started")
         print(f"Input URL: {args.input_url}")
         print(f"Output URL: {args.output_url}")
+        print(f"Codec: {args.codec}")
+        print(f"Bitrate: {args.bitrate}")
+        print(f"Preset: {args.preset}")
+        print(f"GOP size: {args.gop}")
         print("Press Ctrl+C to stop")
         while True:
             time.sleep(1)
