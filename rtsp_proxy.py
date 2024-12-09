@@ -6,15 +6,17 @@ import threading
 from queue import Queue
 import subprocess
 import sys
+import select
 from typing import Optional, Tuple, Dict
 
 class RTSPProxy:
     def __init__(self, input_url: str, output_url: str, timeout_seconds: float = 15.0,
                  codec: str = 'h264', bitrate: str = '2M', preset: str = 'medium',
-                 gop: int = 30):
+                 gop: int = 30, read_timeout: float = 5.0):
         self.input_url = input_url
         self.output_url = output_url
         self.timeout_seconds = timeout_seconds
+        self.read_timeout = read_timeout  # Timeout for reading from FFmpeg
         self.frame_queue = Queue(maxsize=1)  # Only keep latest frame
         self.last_frame_time = 0
         self.running = False
@@ -27,6 +29,23 @@ class RTSPProxy:
         self.bitrate = bitrate
         self.preset = preset
         self.gop = gop
+
+    def kill_process_and_children(self, process):
+        """Kill a process and all its children."""
+        try:
+            process.kill()
+        except:
+            pass
+        try:
+            process.wait(timeout=1)
+        except:
+            pass
+
+    def read_with_timeout(self, pipe, size, timeout):
+        """Read from a pipe with timeout."""
+        if select.select([pipe], [], [], timeout)[0]:
+            return pipe.read(size)
+        return None
 
     def get_codec_parameters(self) -> Dict:
         """Get FFmpeg parameters for the selected codec."""
@@ -70,6 +89,7 @@ class RTSPProxy:
     def read_stream(self):
         """Read frames from input RTSP stream."""
         while self.running:
+            process = None
             try:
                 process = (
                     ffmpeg
@@ -79,12 +99,21 @@ class RTSPProxy:
                     .run_async(pipe_stdout=True, pipe_stderr=True)
                 )
 
+                last_successful_read = time.time()
+                frame_size = self.frame_width * self.frame_height * 3
+
                 while self.running:
-                    frame_size = self.frame_width * self.frame_height * 3
-                    in_bytes = process.stdout.read(frame_size)
-                    if not in_bytes:
-                        break
+                    # Read with timeout
+                    in_bytes = self.read_with_timeout(process.stdout, frame_size, self.read_timeout)
                     
+                    if in_bytes is None or len(in_bytes) != frame_size:
+                        current_time = time.time()
+                        if current_time - last_successful_read > self.read_timeout:
+                            print("FFmpeg input process timed out, restarting...", file=sys.stderr)
+                            self.kill_process_and_children(process)
+                            break
+                        continue
+
                     frame = (
                         np.frombuffer(in_bytes, np.uint8)
                         .reshape([self.frame_height, self.frame_width, 3])
@@ -93,6 +122,7 @@ class RTSPProxy:
                     # Update last frame and timestamp
                     self.last_frame = frame
                     self.last_frame_time = time.time()
+                    last_successful_read = self.last_frame_time
                     
                     # Update queue with latest frame
                     if not self.frame_queue.empty():
@@ -102,14 +132,16 @@ class RTSPProxy:
                             pass
                     self.frame_queue.put(frame)
 
-                process.kill()
             except Exception as e:
                 print(f"Error reading stream: {e}", file=sys.stderr)
+                if process:
+                    self.kill_process_and_children(process)
                 time.sleep(1)  # Wait before retrying
 
     def write_stream(self):
         """Write frames to output RTSP stream."""
         while self.running:
+            process = None
             try:
                 # Get codec parameters
                 codec_params = self.get_codec_parameters()
@@ -126,6 +158,7 @@ class RTSPProxy:
                 print("FFmpeg command:", ' '.join(stream.compile()))
                 
                 process = stream.run_async(pipe_stdin=True)
+                last_write_time = time.time()
 
                 while self.running:
                     current_time = time.time()
@@ -133,6 +166,7 @@ class RTSPProxy:
 
                     try:
                         frame = self.frame_queue.get_nowait()
+                        last_write_time = current_time
                     except:
                         if self.last_frame is not None:
                             if current_time - self.last_frame_time > self.timeout_seconds:
@@ -143,13 +177,26 @@ class RTSPProxy:
                             frame = self.create_error_frame()
 
                     if frame is not None:
-                        process.stdin.write(frame.tobytes())
+                        try:
+                            process.stdin.write(frame.tobytes())
+                            last_write_time = current_time
+                        except:
+                            print("Error writing to FFmpeg, restarting output process...", file=sys.stderr)
+                            self.kill_process_and_children(process)
+                            break
+
+                    # Check if we haven't written anything for too long
+                    if current_time - last_write_time > self.read_timeout:
+                        print("FFmpeg output process timed out, restarting...", file=sys.stderr)
+                        self.kill_process_and_children(process)
+                        break
 
                     time.sleep(1/30)  # Limit to 30 fps
 
-                process.kill()
             except Exception as e:
                 print(f"Error writing stream: {e}", file=sys.stderr)
+                if process:
+                    self.kill_process_and_children(process)
                 time.sleep(1)  # Wait before retrying
 
     def start(self):
@@ -180,9 +227,11 @@ if __name__ == "__main__":
     parser.add_argument('output_url', help='Output RTSP URL')
     parser.add_argument('--timeout', type=float, default=15.0,
                       help='Timeout in seconds before showing error message (default: 15.0)')
+    parser.add_argument('--read-timeout', type=float, default=5.0,
+                      help='Timeout in seconds for reading from FFmpeg (default: 5.0)')
     parser.add_argument('--codec', type=str, default='h264',
                       choices=['libx264', 'libx265', 'copy'],
-                      help='Output codec (default: h264)')
+                      help='Output codec (default: libx264)')
     parser.add_argument('--bitrate', type=str, default='2M',
                       help='Output bitrate (e.g., 2M, 4M, 8M) (default: 2M)')
     parser.add_argument('--preset', type=str, default='medium',
@@ -199,7 +248,8 @@ if __name__ == "__main__":
         codec=args.codec,
         bitrate=args.bitrate,
         preset=args.preset,
-        gop=args.gop
+        gop=args.gop,
+        read_timeout=args.read_timeout
     )
     
     try:
