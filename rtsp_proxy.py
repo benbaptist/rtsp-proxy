@@ -15,7 +15,8 @@ from threading import Event
 class RTSPProxy:
     def __init__(self, input_url: str, output_url: str, timeout_seconds: float = 15.0,
                  codec: str = 'h264', bitrate: str = '2M', preset: str = 'medium',
-                 gop: int = 30, read_timeout: float = 5.0, fps: float = 30.0):
+                 gop: int = 30, read_timeout: float = 5.0, fps: float = 30.0,
+                 width: int = 1920, height: int = 1080):
         self.input_url = input_url
         self.output_url = output_url
         self.timeout_seconds = timeout_seconds
@@ -24,18 +25,24 @@ class RTSPProxy:
         self.last_frame_time = 0
         self.running = False
         self.last_frame: Optional[np.ndarray] = None
-        self.frame_width = 1920
-        self.frame_height = 1080
-        self.fps = fps
-        self.frame_interval = 1.0 / fps  # Time between frames in seconds
         
-        # New attributes for better process management
+        # Resolution settings
+        self.output_width = width
+        self.output_height = height
+        self.input_width = None   # Will be detected from input stream
+        self.input_height = None
+        self.scale_filter = None  # Will be set once input resolution is known
+        
+        self.fps = fps
+        self.frame_interval = 1.0 / fps
+        
+        # Process management
         self.frame_available = Event()
         self.ffmpeg_input_process = None
         self.ffmpeg_output_process = None
         self.last_frame_received = time.time()
         self.last_frame_written = time.time()
-        self.next_frame_time = time.time()  # Used for maintaining constant framerate
+        self.next_frame_time = time.time()
         
         # Encoding parameters
         self.codec = codec
@@ -90,18 +97,17 @@ class RTSPProxy:
         params = {
             'c:v': self.codec,
             'b:v': self.bitrate,
-            'g': str(self.gop),  # GOP size
-            'r': str(self.fps),  # Set output framerate
+            'g': str(self.gop),
+            'r': str(self.fps),
         }
         
-        # Codec-specific parameters
         if self.codec in ['h264', 'libx264']:
             params.update({
                 'preset': self.preset,
                 'tune': 'zerolatency',
                 'profile:v': 'main',
                 'pix_fmt': 'yuv420p',
-                'force_key_frames': f'expr:gte(t,n_forced*{self.gop}/{self.fps})'  # Force keyframes based on GOP and FPS
+                'force_key_frames': f'expr:gte(t,n_forced*{self.gop}/{self.fps})'
             })
         elif self.codec == 'h265' or self.codec == 'libx265':
             params.update({
@@ -116,56 +122,113 @@ class RTSPProxy:
 
     def create_error_frame(self, message: str = "No frames received") -> np.ndarray:
         """Create a black frame with error message."""
-        frame = np.zeros((self.frame_height, self.frame_width, 3), dtype=np.uint8)
+        frame = np.zeros((self.output_height, self.output_width, 3), dtype=np.uint8)
         font = cv2.FONT_HERSHEY_SIMPLEX
         font_scale = 1.5
         thickness = 2
         text_size = cv2.getTextSize(message, font, font_scale, thickness)[0]
-        text_x = (self.frame_width - text_size[0]) // 2
-        text_y = (self.frame_height + text_size[1]) // 2
+        text_x = (self.output_width - text_size[0]) // 2
+        text_y = (self.output_height + text_size[1]) // 2
         cv2.putText(frame, message, (text_x, text_y), font, font_scale, (255, 255, 255), thickness)
         return frame
 
+    def get_input_resolution(self) -> Tuple[int, int]:
+        """Detect input stream resolution using FFprobe."""
+        try:
+            probe = ffmpeg.probe(self.input_url)
+            video_info = next(s for s in probe['streams'] if s['codec_type'] == 'video')
+            return int(video_info['width']), int(video_info['height'])
+        except Exception as e:
+            print(f"Error detecting input resolution: {e}", file=sys.stderr)
+            return self.output_width, self.output_height  # Fallback to output resolution
+
+    def setup_scaling(self):
+        """Configure scaling filter based on input and output resolutions."""
+        # Detect input resolution if not already set
+        if self.input_width is None or self.input_height is None:
+            self.input_width, self.input_height = self.get_input_resolution()
+        
+        if (self.input_width, self.input_height) == (self.output_width, self.output_height):
+            self.scale_filter = None  # No scaling needed
+            return
+        
+        # Calculate scaling parameters to maintain aspect ratio
+        input_aspect = self.input_width / self.input_height
+        output_aspect = self.output_width / self.output_height
+        
+        if input_aspect > output_aspect:
+            # Input is wider - fit to width
+            new_width = self.output_width
+            new_height = int(self.output_width / input_aspect)
+            pad_top = (self.output_height - new_height) // 2
+            pad_bottom = self.output_height - new_height - pad_top
+            self.scale_filter = (
+                f'scale={new_width}:{new_height}:force_original_aspect_ratio=decrease,'
+                f'pad={self.output_width}:{self.output_height}:0:{pad_top}:black'
+            )
+        else:
+            # Input is taller - fit to height
+            new_height = self.output_height
+            new_width = int(self.output_height * input_aspect)
+            pad_left = (self.output_width - new_width) // 2
+            pad_right = self.output_width - new_width - pad_left
+            self.scale_filter = (
+                f'scale={new_width}:{new_height}:force_original_aspect_ratio=decrease,'
+                f'pad={self.output_width}:{self.output_height}:{pad_left}:0:black'
+            )
+
     def read_stream(self):
-        """Read frames from input RTSP stream with improved error handling."""
+        """Read frames from input RTSP stream."""
         while self.running:
             try:
-                self.ffmpeg_input_process = (
+                # Setup scaling on first run or after errors
+                if self.scale_filter is None:
+                    self.setup_scaling()
+                
+                # Build input stream with scaling if needed
+                stream = (
                     ffmpeg
                     .input(self.input_url, rtsp_transport='tcp')
+                )
+                
+                if self.scale_filter:
+                    stream = stream.filter('scale', size=f'{self.output_width}x{self.output_height}',
+                                        force_original_aspect_ratio='decrease')
+                
+                stream = (
+                    stream
                     .output('pipe:', format='rawvideo', pix_fmt='rgb24')
                     .overwrite_output()
-                    .run_async(pipe_stdout=True, pipe_stderr=True)
                 )
+                
+                self.ffmpeg_input_process = stream.run_async(pipe_stdout=True, pipe_stderr=True)
 
-                frame_size = self.frame_width * self.frame_height * 3
                 consecutive_failures = 0
+                frame_size = self.output_width * self.output_height * 3
 
                 while self.running:
                     in_bytes = self.read_with_timeout(self.ffmpeg_input_process.stdout, frame_size, self.read_timeout)
                     
                     if in_bytes is None or len(in_bytes) != frame_size:
                         consecutive_failures += 1
-                        if consecutive_failures >= 3:  # Three strikes rule
+                        if consecutive_failures >= 3:
                             print("Multiple consecutive read failures, restarting input process...", file=sys.stderr)
                             self.kill_process_and_children(self.ffmpeg_input_process)
                             break
-                        time.sleep(0.1)  # Short sleep to prevent CPU spinning
+                        time.sleep(0.1)
                         continue
 
                     consecutive_failures = 0
                     frame = (
                         np.frombuffer(in_bytes, np.uint8)
-                        .reshape([self.frame_height, self.frame_width, 3])
+                        .reshape([self.output_height, self.output_width, 3])
                     )
                     
-                    # Update frame information
                     current_time = time.time()
-                    self.last_frame = frame.copy()  # Create a copy to prevent reference issues
+                    self.last_frame = frame.copy()
                     self.last_frame_time = current_time
                     self.last_frame_received = current_time
                     
-                    # Update queue efficiently
                     while not self.frame_queue.empty():
                         try:
                             self.frame_queue.get_nowait()
@@ -187,7 +250,7 @@ class RTSPProxy:
                 stream = (
                     ffmpeg
                     .input('pipe:', format='rawvideo', pix_fmt='rgb24',
-                           s=f'{self.frame_width}x{self.frame_height}',
+                           s=f'{self.output_width}x{self.output_height}',
                            framerate=str(self.fps))  # Set input framerate
                     .output(self.output_url, format='rtsp', rtsp_transport='tcp', **codec_params)
                     .overwrite_output()
@@ -296,6 +359,10 @@ if __name__ == "__main__":
                       help='GOP size (default: 30)')
     parser.add_argument('--fps', type=float, default=30.0,
                       help='Output framerate (default: 30.0)')
+    parser.add_argument('--width', type=int, default=1920,
+                      help='Output width (default: 1920)')
+    parser.add_argument('--height', type=int, default=1080,
+                      help='Output height (default: 1080)')
     args = parser.parse_args()
 
     proxy = RTSPProxy(
@@ -307,7 +374,9 @@ if __name__ == "__main__":
         preset=args.preset,
         gop=args.gop,
         read_timeout=args.read_timeout,
-        fps=args.fps
+        fps=args.fps,
+        width=args.width,
+        height=args.height
     )
     
     try:
@@ -320,6 +389,7 @@ if __name__ == "__main__":
         print(f"Preset: {args.preset}")
         print(f"GOP size: {args.gop}")
         print(f"Output FPS: {args.fps}")
+        print(f"Output resolution: {args.width}x{args.height}")
         print("Press Ctrl+C to stop")
         while True:
             time.sleep(1)
