@@ -15,7 +15,7 @@ from threading import Event
 class RTSPProxy:
     def __init__(self, input_url: str, output_url: str, timeout_seconds: float = 15.0,
                  codec: str = 'h264', bitrate: str = '2M', preset: str = 'medium',
-                 gop: int = 30, read_timeout: float = 5.0):
+                 gop: int = 30, read_timeout: float = 5.0, fps: float = 30.0):
         self.input_url = input_url
         self.output_url = output_url
         self.timeout_seconds = timeout_seconds
@@ -26,6 +26,8 @@ class RTSPProxy:
         self.last_frame: Optional[np.ndarray] = None
         self.frame_width = 1920
         self.frame_height = 1080
+        self.fps = fps
+        self.frame_interval = 1.0 / fps  # Time between frames in seconds
         
         # New attributes for better process management
         self.frame_available = Event()
@@ -33,6 +35,7 @@ class RTSPProxy:
         self.ffmpeg_output_process = None
         self.last_frame_received = time.time()
         self.last_frame_written = time.time()
+        self.next_frame_time = time.time()  # Used for maintaining constant framerate
         
         # Encoding parameters
         self.codec = codec
@@ -88,6 +91,7 @@ class RTSPProxy:
             'c:v': self.codec,
             'b:v': self.bitrate,
             'g': str(self.gop),  # GOP size
+            'r': str(self.fps),  # Set output framerate
         }
         
         # Codec-specific parameters
@@ -96,12 +100,13 @@ class RTSPProxy:
                 'preset': self.preset,
                 'tune': 'zerolatency',
                 'profile:v': 'main',
-                "pix_fmt": "yuv420p"
+                'pix_fmt': 'yuv420p',
+                'force_key_frames': f'expr:gte(t,n_forced*{self.gop}/{self.fps})'  # Force keyframes based on GOP and FPS
             })
         elif self.codec == 'h265' or self.codec == 'libx265':
             params.update({
                 'preset': self.preset,
-                'x265-params': 'no-repeat-headers=1',
+                'x265-params': f'no-repeat-headers=1:keyint={self.gop}:min-keyint={self.gop}'
             })
         elif self.codec == 'copy':
             # Remove unnecessary parameters for stream copy
@@ -175,56 +180,67 @@ class RTSPProxy:
                 time.sleep(1)
 
     def write_stream(self):
-        """Write frames to output RTSP stream with improved efficiency."""
+        """Write frames to output RTSP stream with constant framerate."""
         while self.running:
             try:
                 codec_params = self.get_codec_parameters()
                 stream = (
                     ffmpeg
-                    .input('pipe:', format='rawvideo', pix_fmt='rgb24', s=f'{self.frame_width}x{self.frame_height}')
+                    .input('pipe:', format='rawvideo', pix_fmt='rgb24',
+                           s=f'{self.frame_width}x{self.frame_height}',
+                           framerate=str(self.fps))  # Set input framerate
                     .output(self.output_url, format='rtsp', rtsp_transport='tcp', **codec_params)
                     .overwrite_output()
                 )
                 
                 self.ffmpeg_output_process = stream.run_async(pipe_stdin=True)
+                self.next_frame_time = time.time()  # Initialize next frame time
                 
                 while self.running:
-                    # Wait for frame with timeout
-                    if not self.frame_available.wait(timeout=0.1):
-                        current_time = time.time()
-                        
-                        # Check for process health
-                        if self.ffmpeg_output_process.poll() is not None:
-                            print("FFmpeg output process died, restarting...", file=sys.stderr)
-                            break
-                            
-                        # Check for timeout conditions
+                    current_time = time.time()
+                    
+                    # Wait until it's time for the next frame
+                    sleep_time = self.next_frame_time - current_time
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
+                    
+                    # Update next frame time
+                    self.next_frame_time += self.frame_interval
+                    # If we're falling behind, reset to maintain sync
+                    if current_time > self.next_frame_time + self.frame_interval:
+                        self.next_frame_time = current_time + self.frame_interval
+                    
+                    # Try to get a new frame
+                    frame = None
+                    if self.frame_available.is_set():
+                        try:
+                            frame = self.frame_queue.get_nowait()
+                            self.frame_available.clear()
+                            self.last_frame = frame.copy()
+                            self.last_frame_written = current_time
+                        except:
+                            pass
+                    
+                    # If no new frame, check if we should use last frame or error frame
+                    if frame is None:
                         if current_time - self.last_frame_received > self.timeout_seconds:
                             frame = self.create_error_frame()
                         elif self.last_frame is not None:
                             frame = self.last_frame
                         else:
                             frame = self.create_error_frame()
-                            
-                        try:
-                            self.ffmpeg_output_process.stdin.write(frame.tobytes())
-                            self.last_frame_written = current_time
-                        except:
-                            print("Error writing to FFmpeg output", file=sys.stderr)
-                            break
-                        continue
-
-                    # Process available frame
+                    
+                    # Write frame
                     try:
-                        frame = self.frame_queue.get_nowait()
-                        self.frame_available.clear()
                         self.ffmpeg_output_process.stdin.write(frame.tobytes())
-                        self.last_frame_written = time.time()
                     except:
-                        pass
-
-                    # Add a small sleep to prevent CPU spinning
-                    time.sleep(0.01)
+                        print("Error writing to FFmpeg output", file=sys.stderr)
+                        break
+                    
+                    # Check process health
+                    if self.ffmpeg_output_process.poll() is not None:
+                        print("FFmpeg output process died, restarting...", file=sys.stderr)
+                        break
 
             except Exception as e:
                 print(f"Error in write_stream: {e}", file=sys.stderr)
@@ -278,6 +294,8 @@ if __name__ == "__main__":
                       help='Encoding preset (default: medium)')
     parser.add_argument('--gop', type=int, default=30,
                       help='GOP size (default: 30)')
+    parser.add_argument('--fps', type=float, default=30.0,
+                      help='Output framerate (default: 30.0)')
     args = parser.parse_args()
 
     proxy = RTSPProxy(
@@ -288,7 +306,8 @@ if __name__ == "__main__":
         bitrate=args.bitrate,
         preset=args.preset,
         gop=args.gop,
-        read_timeout=args.read_timeout
+        read_timeout=args.read_timeout,
+        fps=args.fps
     )
     
     try:
@@ -300,6 +319,7 @@ if __name__ == "__main__":
         print(f"Bitrate: {args.bitrate}")
         print(f"Preset: {args.preset}")
         print(f"GOP size: {args.gop}")
+        print(f"Output FPS: {args.fps}")
         print("Press Ctrl+C to stop")
         while True:
             time.sleep(1)
