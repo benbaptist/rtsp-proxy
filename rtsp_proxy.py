@@ -7,7 +7,10 @@ from queue import Queue
 import subprocess
 import sys
 import select
+import os
+import signal
 from typing import Optional, Tuple, Dict
+from threading import Event
 
 class RTSPProxy:
     def __init__(self, input_url: str, output_url: str, timeout_seconds: float = 15.0,
@@ -16,13 +19,20 @@ class RTSPProxy:
         self.input_url = input_url
         self.output_url = output_url
         self.timeout_seconds = timeout_seconds
-        self.read_timeout = read_timeout  # Timeout for reading from FFmpeg
-        self.frame_queue = Queue(maxsize=1)  # Only keep latest frame
+        self.read_timeout = read_timeout
+        self.frame_queue = Queue(maxsize=1)
         self.last_frame_time = 0
         self.running = False
         self.last_frame: Optional[np.ndarray] = None
-        self.frame_width = 1920  # Default resolution
+        self.frame_width = 1920
         self.frame_height = 1080
+        
+        # New attributes for better process management
+        self.frame_available = Event()
+        self.ffmpeg_input_process = None
+        self.ffmpeg_output_process = None
+        self.last_frame_received = time.time()
+        self.last_frame_written = time.time()
         
         # Encoding parameters
         self.codec = codec
@@ -31,20 +41,45 @@ class RTSPProxy:
         self.gop = gop
 
     def kill_process_and_children(self, process):
-        """Kill a process and all its children."""
+        """Kill a process and all its children more effectively."""
+        if process is None:
+            return
+            
         try:
+            # Send SIGTERM first
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+                return
+            except subprocess.TimeoutExpired:
+                pass
+                
+            # If still running, force kill
             process.kill()
-        except:
-            pass
-        try:
             process.wait(timeout=1)
+            
+            # On Unix-like systems, ensure child processes are killed
+            if hasattr(os, 'killpg'):
+                try:
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                except:
+                    pass
         except:
             pass
 
     def read_with_timeout(self, pipe, size, timeout):
-        """Read from a pipe with timeout."""
-        if select.select([pipe], [], [], timeout)[0]:
-            return pipe.read(size)
+        """Read from a pipe with timeout and better error handling."""
+        if pipe is None:
+            return None
+            
+        try:
+            if select.select([pipe], [], [], timeout)[0]:
+                data = pipe.read(size)
+                if not data or len(data) != size:
+                    return None
+                return data
+        except (select.error, IOError, ValueError):
+            return None
         return None
 
     def get_codec_parameters(self) -> Dict:
@@ -87,11 +122,10 @@ class RTSPProxy:
         return frame
 
     def read_stream(self):
-        """Read frames from input RTSP stream."""
+        """Read frames from input RTSP stream with improved error handling."""
         while self.running:
-            process = None
             try:
-                process = (
+                self.ffmpeg_input_process = (
                     ffmpeg
                     .input(self.input_url, rtsp_transport='tcp')
                     .output('pipe:', format='rawvideo', pix_fmt='rgb24')
@@ -99,54 +133,52 @@ class RTSPProxy:
                     .run_async(pipe_stdout=True, pipe_stderr=True)
                 )
 
-                last_successful_read = time.time()
                 frame_size = self.frame_width * self.frame_height * 3
+                consecutive_failures = 0
 
                 while self.running:
-                    # Read with timeout
-                    in_bytes = self.read_with_timeout(process.stdout, frame_size, self.read_timeout)
+                    in_bytes = self.read_with_timeout(self.ffmpeg_input_process.stdout, frame_size, self.read_timeout)
                     
                     if in_bytes is None or len(in_bytes) != frame_size:
-                        current_time = time.time()
-                        if current_time - last_successful_read > self.read_timeout:
-                            print("FFmpeg input process timed out, restarting...", file=sys.stderr)
-                            self.kill_process_and_children(process)
+                        consecutive_failures += 1
+                        if consecutive_failures >= 3:  # Three strikes rule
+                            print("Multiple consecutive read failures, restarting input process...", file=sys.stderr)
+                            self.kill_process_and_children(self.ffmpeg_input_process)
                             break
+                        time.sleep(0.1)  # Short sleep to prevent CPU spinning
                         continue
 
+                    consecutive_failures = 0
                     frame = (
                         np.frombuffer(in_bytes, np.uint8)
                         .reshape([self.frame_height, self.frame_width, 3])
                     )
                     
-                    # Update last frame and timestamp
-                    self.last_frame = frame
-                    self.last_frame_time = time.time()
-                    last_successful_read = self.last_frame_time
+                    # Update frame information
+                    current_time = time.time()
+                    self.last_frame = frame.copy()  # Create a copy to prevent reference issues
+                    self.last_frame_time = current_time
+                    self.last_frame_received = current_time
                     
-                    # Update queue with latest frame
-                    if not self.frame_queue.empty():
+                    # Update queue efficiently
+                    while not self.frame_queue.empty():
                         try:
                             self.frame_queue.get_nowait()
                         except:
-                            pass
+                            break
                     self.frame_queue.put(frame)
+                    self.frame_available.set()
 
             except Exception as e:
-                print(f"Error reading stream: {e}", file=sys.stderr)
-                if process:
-                    self.kill_process_and_children(process)
-                time.sleep(1)  # Wait before retrying
+                print(f"Error in read_stream: {e}", file=sys.stderr)
+                self.kill_process_and_children(self.ffmpeg_input_process)
+                time.sleep(1)
 
     def write_stream(self):
-        """Write frames to output RTSP stream."""
+        """Write frames to output RTSP stream with improved efficiency."""
         while self.running:
-            process = None
             try:
-                # Get codec parameters
                 codec_params = self.get_codec_parameters()
-                
-                # Build ffmpeg command
                 stream = (
                     ffmpeg
                     .input('pipe:', format='rawvideo', pix_fmt='rgb24', s=f'{self.frame_width}x{self.frame_height}')
@@ -154,70 +186,77 @@ class RTSPProxy:
                     .overwrite_output()
                 )
                 
-                # For debugging: print the ffmpeg command
-                print("FFmpeg command:", ' '.join(stream.compile()))
+                self.ffmpeg_output_process = stream.run_async(pipe_stdin=True)
                 
-                process = stream.run_async(pipe_stdin=True)
-                last_write_time = time.time()
-
                 while self.running:
-                    current_time = time.time()
-                    frame = None
-
-                    try:
-                        frame = self.frame_queue.get_nowait()
-                        last_write_time = current_time
-                    except:
-                        if self.last_frame is not None:
-                            if current_time - self.last_frame_time > self.timeout_seconds:
-                                frame = self.create_error_frame()
-                            else:
-                                frame = self.last_frame
+                    # Wait for frame with timeout
+                    if not self.frame_available.wait(timeout=0.1):
+                        current_time = time.time()
+                        
+                        # Check for process health
+                        if self.ffmpeg_output_process.poll() is not None:
+                            print("FFmpeg output process died, restarting...", file=sys.stderr)
+                            break
+                            
+                        # Check for timeout conditions
+                        if current_time - self.last_frame_received > self.timeout_seconds:
+                            frame = self.create_error_frame()
+                        elif self.last_frame is not None:
+                            frame = self.last_frame
                         else:
                             frame = self.create_error_frame()
-
-                    if frame is not None:
+                            
                         try:
-                            process.stdin.write(frame.tobytes())
-                            last_write_time = current_time
+                            self.ffmpeg_output_process.stdin.write(frame.tobytes())
+                            self.last_frame_written = current_time
                         except:
-                            print("Error writing to FFmpeg, restarting output process...", file=sys.stderr)
-                            self.kill_process_and_children(process)
+                            print("Error writing to FFmpeg output", file=sys.stderr)
                             break
+                        continue
 
-                    # Check if we haven't written anything for too long
-                    if current_time - last_write_time > self.read_timeout:
-                        print("FFmpeg output process timed out, restarting...", file=sys.stderr)
-                        self.kill_process_and_children(process)
-                        break
+                    # Process available frame
+                    try:
+                        frame = self.frame_queue.get_nowait()
+                        self.frame_available.clear()
+                        self.ffmpeg_output_process.stdin.write(frame.tobytes())
+                        self.last_frame_written = time.time()
+                    except:
+                        pass
 
-                    time.sleep(1/30)  # Limit to 30 fps
+                    # Add a small sleep to prevent CPU spinning
+                    time.sleep(0.01)
 
             except Exception as e:
-                print(f"Error writing stream: {e}", file=sys.stderr)
-                if process:
-                    self.kill_process_and_children(process)
-                time.sleep(1)  # Wait before retrying
+                print(f"Error in write_stream: {e}", file=sys.stderr)
+                self.kill_process_and_children(self.ffmpeg_output_process)
+                time.sleep(1)
 
     def start(self):
-        """Start the RTSP proxy."""
+        """Start the RTSP proxy with improved process management."""
         self.running = True
         
-        # Start reader thread
         self.reader_thread = threading.Thread(target=self.read_stream)
         self.reader_thread.daemon = True
         self.reader_thread.start()
 
-        # Start writer thread
         self.writer_thread = threading.Thread(target=self.write_stream)
         self.writer_thread.daemon = True
         self.writer_thread.start()
 
     def stop(self):
-        """Stop the RTSP proxy."""
+        """Stop the RTSP proxy and cleanup resources."""
         self.running = False
-        self.reader_thread.join()
-        self.writer_thread.join()
+        self.frame_available.set()  # Unblock any waiting threads
+        
+        # Kill FFmpeg processes
+        self.kill_process_and_children(self.ffmpeg_input_process)
+        self.kill_process_and_children(self.ffmpeg_output_process)
+        
+        # Wait for threads to finish
+        if hasattr(self, 'reader_thread'):
+            self.reader_thread.join(timeout=2)
+        if hasattr(self, 'writer_thread'):
+            self.writer_thread.join(timeout=2)
 
 if __name__ == "__main__":
     import argparse
