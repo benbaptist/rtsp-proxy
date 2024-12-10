@@ -59,9 +59,9 @@ Required:
 
 Optional:
 - `--timeout SECONDS`: Time before showing "No frames received" message (default: 15.0)
-- `--codec {h264,h265,copy}`: Output codec (default: h264)
-  - `h264`: H.264/AVC encoding
-  - `h265`: H.265/HEVC encoding
+- `--codec {libx264,libx265,copy}`: Output codec (default: libx264)
+  - `libx264`: H.264/AVC encoding
+  - `libx265`: H.265/HEVC encoding
   - `copy`: Stream copy (no re-encoding)
 - `--bitrate BITRATE`: Output bitrate (e.g., 2M, 4M, 8M) (default: 2M)
 - `--preset {ultrafast,superfast,veryfast,faster,fast,medium,slow,slower,veryslow}`: 
