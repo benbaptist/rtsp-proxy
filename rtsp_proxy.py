@@ -133,6 +133,46 @@ class RTSPProxy:
         cv2.putText(frame, message, (text_x, text_y), font, font_scale, (255, 255, 255), thickness)
         return frame
 
+    def add_status_overlay(self, frame: np.ndarray, seconds_since_frame: float) -> np.ndarray:
+        """Add a semi-transparent overlay with status information."""
+        # Only add overlay if more than 1 second without frames
+        if seconds_since_frame <= 1.0:
+            return frame
+        
+        # Create overlay text
+        text = f"No frames received for {seconds_since_frame:.1f}s"
+        
+        # Setup text parameters
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.7
+        thickness = 2
+        color = (255, 255, 255)  # White text
+        
+        # Get text size
+        text_size = cv2.getTextSize(text, font, font_scale, thickness)[0]
+        
+        # Calculate box dimensions with padding
+        padding = 10
+        box_width = text_size[0] + 2 * padding
+        box_height = text_size[1] + 2 * padding
+        
+        # Create overlay box
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0, 0), (box_width, box_height), (0, 0, 0), -1)
+        
+        # Add text
+        text_x = padding
+        text_y = text_size[1] + padding
+        cv2.putText(overlay, text, (text_x, text_y), font, font_scale, color, thickness)
+        
+        # Blend overlay with original frame
+        alpha = 0.7  # Transparency factor
+        frame_region = frame[0:box_height, 0:box_width]
+        frame[0:box_height, 0:box_width] = cv2.addWeighted(frame_region, alpha, 
+                                                          overlay[0:box_height, 0:box_width], 
+                                                          1 - alpha, 0)
+        return frame
+
     def get_input_resolution(self) -> Tuple[Optional[int], Optional[int]]:
         """Detect input stream resolution using FFprobe with retries."""
         max_retries = 5
@@ -279,13 +319,13 @@ class RTSPProxy:
                     ffmpeg
                     .input('pipe:', format='rawvideo', pix_fmt='rgb24',
                            s=f'{self.output_width}x{self.output_height}',
-                           framerate=str(self.fps))  # Set input framerate
+                           framerate=str(self.fps))
                     .output(self.output_url, format='rtsp', rtsp_transport='tcp', **codec_params)
                     .overwrite_output()
                 )
                 
                 self.ffmpeg_output_process = stream.run_async(pipe_stdin=True)
-                self.next_frame_time = time.time()  # Initialize next frame time
+                self.next_frame_time = time.time()
                 
                 while self.running:
                     current_time = time.time()
@@ -297,7 +337,6 @@ class RTSPProxy:
                     
                     # Update next frame time
                     self.next_frame_time += self.frame_interval
-                    # If we're falling behind, reset to maintain sync
                     if current_time > self.next_frame_time + self.frame_interval:
                         self.next_frame_time = current_time + self.frame_interval
                     
@@ -314,10 +353,13 @@ class RTSPProxy:
                     
                     # If no new frame, check if we should use last frame or error frame
                     if frame is None:
-                        if current_time - self.last_frame_received > self.timeout_seconds:
+                        seconds_without_frames = current_time - self.last_frame_received
+                        if seconds_without_frames > self.timeout_seconds:
                             frame = self.create_error_frame()
                         elif self.last_frame is not None:
-                            frame = self.last_frame
+                            frame = self.last_frame.copy()
+                            # Add overlay showing time without frames if > 1 second
+                            frame = self.add_status_overlay(frame, seconds_without_frames)
                         else:
                             frame = self.create_error_frame()
                     
