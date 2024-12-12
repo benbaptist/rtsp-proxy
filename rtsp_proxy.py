@@ -16,7 +16,8 @@ class RTSPProxy:
     def __init__(self, input_url: str, output_url: str, timeout_seconds: float = 15.0,
                  codec: str = 'h264', bitrate: str = '2M', preset: str = 'medium',
                  gop: int = 30, read_timeout: float = 5.0, fps: float = 30.0,
-                 width: int = 1920, height: int = 1080):
+                 width: int = 1920, height: int = 1080, 
+                 input_width: Optional[int] = None, input_height: Optional[int] = None):
         self.input_url = input_url
         self.output_url = output_url
         self.timeout_seconds = timeout_seconds
@@ -29,9 +30,9 @@ class RTSPProxy:
         # Resolution settings
         self.output_width = width
         self.output_height = height
-        self.input_width = None   # Will be detected from input stream
-        self.input_height = None
-        self.scale_filter = None  # Will be set once input resolution is known
+        self.input_width = input_width   # Can be manually specified now
+        self.input_height = input_height
+        self.scale_filter = None
         
         self.fps = fps
         self.frame_interval = 1.0 / fps
@@ -132,67 +133,74 @@ class RTSPProxy:
         cv2.putText(frame, message, (text_x, text_y), font, font_scale, (255, 255, 255), thickness)
         return frame
 
-    def get_input_resolution(self) -> Tuple[int, int]:
-        """Detect input stream resolution using FFprobe."""
-        try:
-            probe = ffmpeg.probe(self.input_url)
-            video_info = next(s for s in probe['streams'] if s['codec_type'] == 'video')
-            width = int(video_info['width'])
-            height = int(video_info['height'])
-            print(f"Detected input resolution: {width}x{height}", file=sys.stderr)
-            return width, height
-        except Exception as e:
-            print(f"Error detecting input resolution: {e}", file=sys.stderr)
-            print("Falling back to output resolution", file=sys.stderr)
-            return self.output_width, self.output_height  # Fallback to output resolution
+    def get_input_resolution(self) -> Tuple[Optional[int], Optional[int]]:
+        """Detect input stream resolution using FFprobe with retries."""
+        max_retries = 5
+        retry_delay = 2
+        
+        for attempt in range(max_retries):
+            try:
+                probe = ffmpeg.probe(self.input_url)
+                video_info = next(s for s in probe['streams'] if s['codec_type'] == 'video')
+                width = int(video_info['width'])
+                height = int(video_info['height'])
+                
+                if width <= 0 or height <= 0:
+                    raise ValueError(f"Invalid dimensions detected: {width}x{height}")
+                    
+                print(f"Detected input resolution: {width}x{height}", file=sys.stderr)
+                return width, height
+                
+            except Exception as e:
+                print(f"Error detecting input resolution (attempt {attempt + 1}/{max_retries}): {e}", 
+                      file=sys.stderr)
+                if attempt < max_retries - 1:
+                    print(f"Retrying in {retry_delay} seconds...", file=sys.stderr)
+                    time.sleep(retry_delay)
+            
+        print("Failed to detect input resolution after all retries", file=sys.stderr)
+        return None, None
 
     def setup_scaling(self):
         """Configure scaling filter based on input and output resolutions."""
-        try:
-            # Detect input resolution if not already set
-            if self.input_width is None or self.input_height is None:
-                self.input_width, self.input_height = self.get_input_resolution()
+        # If dimensions were manually specified, use them
+        if self.input_width is None or self.input_height is None:
+            self.input_width, self.input_height = self.get_input_resolution()
             
-            # Validate dimensions are positive numbers
-            if not all(isinstance(x, (int, float)) and x > 0 for x in 
-                      [self.input_width, self.input_height, self.output_width, self.output_height]):
-                print("Invalid dimensions detected, using output dimensions as fallback", file=sys.stderr)
-                self.input_width, self.input_height = self.output_width, self.output_height
-                self.scale_filter = None
-                return
+        # If we still don't have valid dimensions, don't set up scaling yet
+        if self.input_width is None or self.input_height is None:
+            self.scale_filter = None
+            return False
             
-            if (self.input_width, self.input_height) == (self.output_width, self.output_height):
-                self.scale_filter = None  # No scaling needed
-                return
+        if (self.input_width, self.input_height) == (self.output_width, self.output_height):
+            self.scale_filter = None  # No scaling needed
+            return True
             
-            # Calculate scaling parameters to maintain aspect ratio
-            input_aspect = self.input_width / self.input_height
-            output_aspect = self.output_width / self.output_height
-            
-            if input_aspect > output_aspect:
-                # Input is wider - fit to width
-                new_width = self.output_width
-                new_height = int(self.output_width / input_aspect)
-                pad_top = (self.output_height - new_height) // 2
-                pad_bottom = self.output_height - new_height - pad_top
-                self.scale_filter = (
-                    f'scale={new_width}:{new_height}:force_original_aspect_ratio=decrease,'
-                    f'pad={self.output_width}:{self.output_height}:0:{pad_top}:black'
-                )
-            else:
-                # Input is taller - fit to height
-                new_height = self.output_height
-                new_width = int(self.output_height * input_aspect)
-                pad_left = (self.output_width - new_width) // 2
-                pad_right = self.output_width - new_width - pad_left
-                self.scale_filter = (
-                    f'scale={new_width}:{new_height}:force_original_aspect_ratio=decrease,'
-                    f'pad={self.output_width}:{self.output_height}:{pad_left}:0:black'
-                )
-        except Exception as e:
-            print(f"Error in setup_scaling: {e}", file=sys.stderr)
-            # Fallback to simple scaling without aspect ratio preservation
-            self.scale_filter = f'scale={self.output_width}:{self.output_height}'
+        # Calculate scaling parameters to maintain aspect ratio
+        input_aspect = self.input_width / self.input_height
+        output_aspect = self.output_width / self.output_height
+        
+        if input_aspect > output_aspect:
+            # Input is wider - fit to width
+            new_width = self.output_width
+            new_height = int(self.output_width / input_aspect)
+            pad_top = (self.output_height - new_height) // 2
+            pad_bottom = self.output_height - new_height - pad_top
+            self.scale_filter = (
+                f'scale={new_width}:{new_height}:force_original_aspect_ratio=decrease,'
+                f'pad={self.output_width}:{self.output_height}:0:{pad_top}:black'
+            )
+        else:
+            # Input is taller - fit to height
+            new_height = self.output_height
+            new_width = int(self.output_height * input_aspect)
+            pad_left = (self.output_width - new_width) // 2
+            pad_right = self.output_width - new_width - pad_left
+            self.scale_filter = (
+                f'scale={new_width}:{new_height}:force_original_aspect_ratio=decrease,'
+                f'pad={self.output_width}:{self.output_height}:{pad_left}:0:black'
+            )
+        return True
 
     def read_stream(self):
         """Read frames from input RTSP stream."""
@@ -200,7 +208,10 @@ class RTSPProxy:
             try:
                 # Setup scaling on first run or after errors
                 if self.scale_filter is None:
-                    self.setup_scaling()
+                    if not self.setup_scaling():
+                        print("Failed to setup scaling, retrying in 5 seconds...", file=sys.stderr)
+                        time.sleep(5)
+                        continue
                 
                 # Build input stream with scaling if needed
                 stream = (
@@ -380,6 +391,10 @@ if __name__ == "__main__":
                       help='Output width (default: 1920)')
     parser.add_argument('--height', type=int, default=1080,
                       help='Output height (default: 1080)')
+    parser.add_argument('--input-width', type=int,
+                      help='Input width (if known). Will auto-detect if not specified.')
+    parser.add_argument('--input-height', type=int,
+                      help='Input height (if known). Will auto-detect if not specified.')
     args = parser.parse_args()
 
     proxy = RTSPProxy(
@@ -393,7 +408,9 @@ if __name__ == "__main__":
         read_timeout=args.read_timeout,
         fps=args.fps,
         width=args.width,
-        height=args.height
+        height=args.height,
+        input_width=args.input_width,
+        input_height=args.input_height
     )
     
     try:
